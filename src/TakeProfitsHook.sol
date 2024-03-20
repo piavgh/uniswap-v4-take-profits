@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.21;
 
+import {console} from "forge-std/Console.sol";
 import {IERC20} from "openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 import {BaseHook} from "v4-periphery/BaseHook.sol";
 import {ERC1155} from "openzeppelin-contracts/contracts/token/ERC1155/ERC1155.sol";
@@ -90,38 +91,6 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         return TakeProfitsHook.afterInitialize.selector;
     }
 
-    function afterSwap(
-        address addr,
-        PoolKey calldata key,
-        IPoolManager.SwapParams calldata params,
-        BalanceDelta,
-        bytes calldata
-    ) external override poolManagerOnly returns (bytes4) {
-        // Every time we fulfill an order, we do a swap
-        // So it creates an `afterSwap` call back to ourselves
-        // This opens us up for re-entrancy attacks
-        // So if we detect we are calling ourselves, we return early and don't try to fulfill any orders
-        if (addr == address(this)) {
-            return TakeProfitsHook.afterSwap.selector;
-        }
-
-        bool attemptToFillMoreOrders = true;
-        int24 currentTickLower;
-
-        // While we have any possibility of having orders left to fulfill
-        while (attemptToFillMoreOrders) {
-            // Try fulfilling orders
-            (attemptToFillMoreOrders, currentTickLower) = _tryFulfillingOrders(
-                key,
-                params
-            );
-            // Update `tickLowerLasts` to have the value of `currentTickLower` after the last iteration
-            tickLowerLasts[key.toId()] = currentTickLower;
-        }
-
-        return TakeProfitsHook.afterSwap.selector;
-    }
-
     // Core Utilities
     function placeOrder(
         PoolKey calldata key,
@@ -187,45 +156,6 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         IERC20(tokenToBeSoldContract).transfer(msg.sender, amountIn);
     }
 
-    function fillOrder(
-        PoolKey calldata key,
-        int24 tick,
-        bool zeroForOne,
-        int256 amountIn
-    ) internal {
-        // Setup the swapping parameters
-        IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
-            zeroForOne: zeroForOne,
-            amountSpecified: amountIn,
-            // Set the price limit to be the least possible if swapping from Token 0 to Token 1
-            // or the maximum possible if swapping from Token 1 to Token 0
-            // i.e. infinite slippage allowed
-            sqrtPriceLimitX96: zeroForOne
-                ? TickMath.MIN_SQRT_RATIO + 1
-                : TickMath.MAX_SQRT_RATIO - 1
-        });
-
-        BalanceDelta delta = abi.decode(
-            poolManager.lock(
-                abi.encodeCall(this._handleSwap, (key, swapParams))
-            ),
-            (BalanceDelta)
-        );
-
-        // Update mapping to reflect that `amountIn` worth of tokens have been swapped from this order
-        takeProfitPositions[key.toId()][tick][zeroForOne] -= amountIn;
-
-        uint256 tokenId = getTokenId(key, tick, zeroForOne);
-
-        // Flip the sign of the delta as tokens we were owed by Uniswap are represented as a negative delta change
-        uint256 amountOfTokensReceivedFromSwap = zeroForOne
-            ? uint256(int256(-delta.amount1()))
-            : uint256(int256(-delta.amount0()));
-
-        // Update the amount of tokens claimable for this order
-        tokenIdClaimable[tokenId] += amountOfTokensReceivedFromSwap;
-    }
-
     function redeem(
         uint256 tokenId,
         uint256 amountIn,
@@ -266,6 +196,41 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         _burn(msg.sender, tokenId, amountIn);
 
         IERC20(tokenToSendContract).transfer(destination, amountToSend);
+    }
+
+    function afterSwap(
+        address addr,
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        BalanceDelta,
+        bytes calldata
+    ) external override poolManagerOnly returns (bytes4) {
+        // Every time we fulfill an order, we do a swap
+        // So it creates an `afterSwap` call back to ourselves
+        // This opens us up for re-entrancy attacks
+        // So if we detect we are calling ourselves, we return early and don't try to fulfill any orders
+        if (addr == address(this)) {
+            return TakeProfitsHook.afterSwap.selector;
+        }
+
+        console.log("TakeProfitsHook contract address: ", address(this));
+        console.log("TakeProfitsHook: afterSwap called with addr: ", addr);
+
+        bool attemptToFillMoreOrders = true;
+        int24 currentTickLower;
+
+        // While we have any possibility of having orders left to fulfill
+        while (attemptToFillMoreOrders) {
+            // Try fulfilling orders
+            (attemptToFillMoreOrders, currentTickLower) = _tryFulfillingOrders(
+                key,
+                params
+            );
+            // Update `tickLowerLasts` to have the value of `currentTickLower` after the last iteration
+            tickLowerLasts[key.toId()] = currentTickLower;
+        }
+
+        return TakeProfitsHook.afterSwap.selector;
     }
 
     function _tryFulfillingOrders(
@@ -336,6 +301,45 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         // If we did not return by now, there are no orders possibly left to fulfill within the range
         // Return `false` and the currentTickLower value
         return (false, currentTickLower);
+    }
+
+    function fillOrder(
+        PoolKey calldata key,
+        int24 tick,
+        bool zeroForOne,
+        int256 amountIn
+    ) internal {
+        // Setup the swapping parameters
+        IPoolManager.SwapParams memory swapParams = IPoolManager.SwapParams({
+            zeroForOne: zeroForOne,
+            amountSpecified: amountIn,
+            // Set the price limit to be the least possible if swapping from Token 0 to Token 1
+            // or the maximum possible if swapping from Token 1 to Token 0
+            // i.e. infinite slippage allowed
+            sqrtPriceLimitX96: zeroForOne
+                ? TickMath.MIN_SQRT_RATIO + 1
+                : TickMath.MAX_SQRT_RATIO - 1
+        });
+
+        BalanceDelta delta = abi.decode(
+            poolManager.lock(
+                abi.encodeCall(this._handleSwap, (key, swapParams))
+            ),
+            (BalanceDelta)
+        );
+
+        // Update mapping to reflect that `amountIn` worth of tokens have been swapped from this order
+        takeProfitPositions[key.toId()][tick][zeroForOne] -= amountIn;
+
+        uint256 tokenId = getTokenId(key, tick, zeroForOne);
+
+        // Flip the sign of the delta as tokens we were owed by Uniswap are represented as a negative delta change
+        uint256 amountOfTokensReceivedFromSwap = zeroForOne
+            ? uint256(int256(-delta.amount1()))
+            : uint256(int256(-delta.amount0()));
+
+        // Update the amount of tokens claimable for this order
+        tokenIdClaimable[tokenId] += amountOfTokensReceivedFromSwap;
     }
 
     function _handleSwap(
